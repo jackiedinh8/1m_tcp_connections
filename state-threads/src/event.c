@@ -1241,6 +1241,11 @@ ST_HIDDEN void _st_epoll_dispatch(void)
         min_timeout = (_ST_SLEEPQ->due <= _ST_LAST_CLOCK) ? 0 :
             (_ST_SLEEPQ->due - _ST_LAST_CLOCK);
         timeout = (int) (min_timeout / 1000);
+
+        // wait 1ms to avoid epoll_wait spin loop.
+        if (min_timeout > 0 && timeout == 0) {
+            timeout = 1;
+        }
     }
 
     if (_st_epoll_data->pid != getpid()) {

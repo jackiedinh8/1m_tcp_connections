@@ -42,7 +42,11 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
 #include <pwd.h>
+
 #include "st.h"
 
 
@@ -52,7 +56,7 @@
 
 /* Log files */
 #define PID_FILE    "pid"
-#define ERRORS_FILE "errors"
+#define ERRORS_FILE "state_errors.log"
 #define ACCESS_FILE "access"
 
 /* Default server port */
@@ -65,10 +69,10 @@
 #define MAX_BIND_ADDRS 16
 
 /* Max number of "spare" threads per process per socket */
-#define MAX_WAIT_THREADS_DEFAULT 8
+#define MAX_WAIT_THREADS_DEFAULT 32
 
 /* Number of file descriptors needed to handle one client session */
-#define FD_PER_THREAD 2
+#define FD_PER_THREAD 256
 
 /* Access log buffer flushing interval (in seconds) */
 #define ACCLOG_FLUSH_INTERVAL 30
@@ -76,6 +80,7 @@
 /* Request read timeout (in seconds) */
 #define REQUEST_TIMEOUT 30
 
+#define MONITOR_INTERVAL 3
 
 /******************************************************************
  * Global data
@@ -135,6 +140,16 @@ static int min_wait_threads = 2;  /* Min number of "spare" threads */
 #define TOTAL_THREADS(i) (WAIT_THREADS(i) + BUSY_THREADS(i))
 #define RQST_COUNT(i)    (srv_socket[i].rqst_count)
 
+#define SEM_ID    250    /* ID for the semaphore.     */
+int sem_set_id; /* ID of the semaphore set.           */
+int shm_id;     /* ID of the shared memory segment.   */
+char* shm_addr; /* address of shared memory segment.  */
+
+struct stats {
+  int current_tcp_cnt;
+};
+struct stats *server_stats;
+
 
 /******************************************************************
  * Forward declarations
@@ -154,6 +169,7 @@ static void install_sighandlers(void);
 static void start_threads(void);
 static void *process_signals(void *arg);
 static void *flush_acclog_buffer(void *arg);
+static void *print_stats(void *arg);
 static void *handle_connections(void *arg);
 static void dump_server_info(void);
 
@@ -173,6 +189,62 @@ extern void err_sys_dump(int fd, const char *fmt, ...);
 extern void err_report(int fd, const char *fmt, ...);
 extern void err_quit(int fd, const char *fmt, ...);
 
+/*
+ * function: sem_lock. locks the semaphore, for exclusive access to a resource.
+ * input:    semaphore set ID.
+ * output:   none.
+ */
+void
+sem_lock(int sem_set_id)
+{
+    /* structure for semaphore operations.   */
+    struct sembuf sem_op;
+
+    /* wait on the semaphore, unless it's value is non-negative. */
+    sem_op.sem_num = 0;
+    sem_op.sem_op = -1;
+    sem_op.sem_flg = 0;
+    semop(sem_set_id, &sem_op, 1);
+}
+
+/*
+ * function: sem_unlock. un-locks the semaphore.
+ * input:    semaphore set ID.
+ * output:   none.
+ */
+void
+sem_unlock(int sem_set_id)
+{
+    /* structure for semaphore operations.   */
+    struct sembuf sem_op;
+
+    /* signal the semaphore - increase its value by one. */
+    sem_op.sem_num = 0;
+    sem_op.sem_op = 1;   /* <-- Comment 3 */
+    sem_op.sem_flg = 0;
+    semop(sem_set_id, &sem_op, 1);
+}
+
+void increase_connection_count(int sem_set_id)
+{
+    sem_lock(sem_set_id);
+    server_stats->current_tcp_cnt++;
+    sem_unlock(sem_set_id);
+}
+
+void decrease_connection_count(int sem_set_id)
+{
+    sem_lock(sem_set_id);
+    server_stats->current_tcp_cnt--;
+    sem_unlock(sem_set_id);
+}
+
+void print_connection_count(int sem_set_id)
+{
+    sem_lock(sem_set_id);
+    err_report(errfd, "INFO: tcp connections: %d", server_stats->current_tcp_cnt);
+    sem_unlock(sem_set_id);
+}
 
 /*
  * General server example: accept a client connection and do something.
@@ -210,6 +282,43 @@ extern void err_quit(int fd, const char *fmt, ...);
  */
 int main(int argc, char *argv[])
 {
+  union semun {         /* semaphore value, for semctl().     */
+      int val;
+      struct semid_ds *buf;
+      ushort * array;
+  } sem_val;
+  /* create a semaphore set with ID 250, with one semaphore   */
+  /* in it, with access only to the owner.                    */
+  sem_set_id = semget(SEM_ID, 1, IPC_CREAT | 0600);
+  if (sem_set_id == -1) {
+     perror("main: semget");
+     exit(1);
+  }
+
+  /* intialize the first (and single) semaphore in our set to '1'. */
+  sem_val.val = 1;
+  int rc = semctl(sem_set_id, 0, SETVAL, sem_val);
+  if (rc == -1) {
+    perror("main: semctl");
+    exit(1);
+  }
+  /* allocate a shared memory segment with size of 2048 bytes. */
+  //shm_id = shmget(100, 2028, IPC_CREAT | IPC_EXCL | 0600);
+  shm_id = shmget(100, 2028, IPC_CREAT | 0600);
+  if (shm_id == -1) {
+      perror("main: shmget: ");
+      exit(1);
+  }
+
+  /* attach the shared memory segment to our process's address space. */
+  shm_addr = shmat(shm_id, NULL, 0);
+  if (!shm_addr) { /* operation failed. */
+      perror("main: shmat: ");
+      exit(1);
+  }
+  memset(shm_addr, 0, 2048);
+  server_stats = (struct stats*)shm_addr;
+
   /* Parse command-line options */
   parse_arguments(argc, argv);
 
@@ -266,23 +375,23 @@ int main(int argc, char *argv[])
 static void usage(const char *progname)
 {
   fprintf(stderr, "Usage: %s -l <log_directory> [<options>]\n\n"
-	  "Possible options:\n\n"
-	  "\t-b <host>:<port>        Bind to specified address. Multiple"
-	  " addresses\n"
-	  "\t                        are permitted.\n"
-	  "\t-p <num_processes>      Create specified number of processes.\n"
-	  "\t-t <min_thr>:<max_thr>  Specify thread limits per listening"
-	  " socket\n"
-	  "\t                        across all processes.\n"
-	  "\t-u <user>               Change server's user id to specified"
-	  " value.\n"
-	  "\t-q <backlog>            Set max length of pending connections"
-	  " queue.\n"
-	  "\t-a                      Enable access logging.\n"
-	  "\t-i                      Run in interactive mode.\n"
-	  "\t-S                      Serialize all accept() calls.\n"
-	  "\t-h                      Print this message.\n",
-	  progname);
+     "Possible options:\n\n"
+     "\t-b <host>:<port>        Bind to specified address. Multiple"
+     " addresses\n"
+     "\t                        are permitted.\n"
+     "\t-p <num_processes>      Create specified number of processes.\n"
+     "\t-t <min_thr>:<max_thr>  Specify thread limits per listening"
+     " socket\n"
+     "\t                        across all processes.\n"
+     "\t-u <user>               Change server's user id to specified"
+     " value.\n"
+     "\t-q <backlog>            Set max length of pending connections"
+     " queue.\n"
+     "\t-a                      Enable access logging.\n"
+     "\t-i                      Run in interactive mode.\n"
+     "\t-S                      Serialize all accept() calls.\n"
+     "\t-h                      Print this message.\n",
+     progname);
   exit(1);
 }
 
@@ -299,16 +408,16 @@ static void parse_arguments(int argc, char *argv[])
     switch (opt) {
     case 'b':
       if (sk_count >= MAX_BIND_ADDRS)
-	err_quit(errfd, "ERROR: max number of bind addresses (%d) exceeded",
-		 MAX_BIND_ADDRS);
+   err_quit(errfd, "ERROR: max number of bind addresses (%d) exceeded",
+       MAX_BIND_ADDRS);
       if ((c = strdup(optarg)) == NULL)
-	err_sys_quit(errfd, "ERROR: strdup");
+   err_sys_quit(errfd, "ERROR: strdup");
       srv_socket[sk_count++].addr = c;
       break;
     case 'p':
       vp_count = atoi(optarg);
       if (vp_count < 1)
-	err_quit(errfd, "ERROR: invalid number of processes: %s", optarg);
+   err_quit(errfd, "ERROR: invalid number of processes: %s", optarg);
       break;
     case 'l':
       logdir = optarg;
@@ -316,9 +425,9 @@ static void parse_arguments(int argc, char *argv[])
     case 't':
       max_wait_threads = (int) strtol(optarg, &c, 10);
       if (*c++ == ':')
-	max_threads = atoi(c);
+   max_threads = atoi(c);
       if (max_wait_threads < 0 || max_threads < 0)
-	err_quit(errfd, "ERROR: invalid number of threads: %s", optarg);
+   err_quit(errfd, "ERROR: invalid number of threads: %s", optarg);
       break;
     case 'u':
       username = optarg;
@@ -326,7 +435,7 @@ static void parse_arguments(int argc, char *argv[])
     case 'q':
       listenq_size = atoi(optarg);
       if (listenq_size < 1)
-	err_quit(errfd, "ERROR: invalid listen queue size: %s", optarg);
+   err_quit(errfd, "ERROR: invalid listen queue size: %s", optarg);
       break;
     case 'a':
       log_access = 1;
@@ -435,6 +544,8 @@ static void set_thread_throttling(void)
 
   if (min_wait_threads > max_wait_threads)
     min_wait_threads = max_wait_threads;
+  
+  printf("max threads: %d, vp_cout: %d\n", max_threads, vp_count);
 }
 
 
@@ -448,6 +559,7 @@ static void create_listeners(void)
   struct hostent *hp;
   unsigned short port;
 
+  printf("num of listen sockets: %d\n", sk_count);
   for (i = 0; i < sk_count; i++) {
     port = 0;
     if ((c = strchr(srv_socket[i].addr, ':')) != NULL) {
@@ -472,8 +584,8 @@ static void create_listeners(void)
     if (serv_addr.sin_addr.s_addr == INADDR_NONE) {
       /* not dotted-decimal */
       if ((hp = gethostbyname(srv_socket[i].addr)) == NULL)
-	err_quit(errfd, "ERROR: can't resolve address: %s",
-		 srv_socket[i].addr);
+   err_quit(errfd, "ERROR: can't resolve address: %s",
+       srv_socket[i].addr);
       memcpy(&serv_addr.sin_addr, hp->h_addr, hp->h_length);
     }
     srv_socket[i].port = port;
@@ -481,7 +593,7 @@ static void create_listeners(void)
     /* Do bind and listen */
     if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
       err_sys_quit(errfd, "ERROR: can't bind to address %s, port %hu",
-		   srv_socket[i].addr, port);
+         srv_socket[i].addr, port);
     if (listen(sock, listenq_size) < 0)
       err_sys_quit(errfd, "ERROR: listen");
 
@@ -562,13 +674,14 @@ static void start_processes(void)
     return;
   }
 
+  printf("start vp processes: %d\n", vp_count);
   for (i = 0; i < vp_count; i++) {
     if ((pid = fork()) < 0) {
       err_sys_report(errfd, "ERROR: can't create process: fork");
       if (i == 0)
-	exit(1);
+   exit(1);
       err_report(errfd, "WARN: started only %d processes out of %d", i,
-		 vp_count);
+       vp_count);
       vp_count = i;
       break;
     }
@@ -585,6 +698,17 @@ static void start_processes(void)
    * Parent process becomes a "watchdog" and never returns to main().
    */
 
+  if ((pid = fork()) == 0) { // child process
+    //if (st_thread_create(print_stats, NULL, 0, 0) == NULL)
+    //  err_sys_quit(errfd, "ERROR: process %d (pid %d): can't create"
+    //     " monitoring thread", my_index, my_pid);
+    for ( ; ; ) {
+      st_sleep(MONITOR_INTERVAL);
+      print_connection_count(sem_set_id);
+    }
+  }
+
+
   /* Install signal handlers */
   Signal(SIGTERM, wdog_sighandler);  /* terminate */
   Signal(SIGHUP,  wdog_sighandler);  /* restart   */
@@ -594,13 +718,13 @@ static void start_processes(void)
   for ( ; ; ) {
     if ((pid = wait(&status)) < 0) {
       if (errno == EINTR)
-	continue;
+   continue;
       err_sys_quit(errfd, "ERROR: watchdog: wait");
     }
     /* Find index of the exited child */
     for (i = 0; i < vp_count; i++) {
       if (vp_pids[i] == pid)
-	break;
+   break;
     }
 
     /* Block signals while printing and forking */
@@ -612,16 +736,16 @@ static void start_processes(void)
 
     if (WIFEXITED(status))
       err_report(errfd, "WARN: watchdog: process %d (pid %d) exited"
-		 " with status %d", i, pid, WEXITSTATUS(status));
+       " with status %d", i, pid, WEXITSTATUS(status));
     else if (WIFSIGNALED(status))
       err_report(errfd, "WARN: watchdog: process %d (pid %d) terminated"
-		 " by signal %d", i, pid, WTERMSIG(status));
+       " by signal %d", i, pid, WTERMSIG(status));
     else if (WIFSTOPPED(status))
       err_report(errfd, "WARN: watchdog: process %d (pid %d) stopped"
-		 " by signal %d", i, pid, WSTOPSIG(status));
+       " by signal %d", i, pid, WSTOPSIG(status));
     else
       err_report(errfd, "WARN: watchdog: process %d (pid %d) terminated:"
-		 " unknown termination reason", i, pid);
+       " unknown termination reason", i, pid);
 
     /* Fork another VP */
     if ((pid = fork()) < 0) {
@@ -695,11 +819,11 @@ static void install_sighandlers(void)
   /* Create signal pipe */
   if (pipe(p) < 0)
     err_sys_quit(errfd, "ERROR: process %d (pid %d): can't create"
-		 " signal pipe: pipe", my_index, my_pid);
+       " signal pipe: pipe", my_index, my_pid);
   if ((sig_pipe[0] = st_netfd_open(p[0])) == NULL ||
       (sig_pipe[1] = st_netfd_open(p[1])) == NULL)
     err_sys_quit(errfd, "ERROR: process %d (pid %d): can't create"
-		 " signal pipe: st_netfd_open", my_index, my_pid);
+       " signal pipe: st_netfd_open", my_index, my_pid);
 
   /* Install signal handlers */
   Signal(SIGTERM, child_sighandler);  /* terminate */
@@ -727,7 +851,7 @@ static void child_sighandler(int signo)
   /* write() is async-safe */
   if (write(fd, &signo, sizeof(int)) != sizeof(int))
     err_sys_quit(errfd, "ERROR: process %d (pid %d): child's signal"
-		 " handler: write", my_index, my_pid);
+       " handler: write", my_index, my_pid);
   errno = err;
 }
 
@@ -744,28 +868,29 @@ static void *process_signals(void *arg)
   for ( ; ; ) {
     /* Read the next signal from the signal pipe */
     if (st_read(sig_pipe[0], &signo, sizeof(int),
-     ST_UTIME_NO_TIMEOUT) != sizeof(int))
+          ST_UTIME_NO_TIMEOUT) != sizeof(int)) {
       err_sys_quit(errfd, "ERROR: process %d (pid %d): signal processor:"
-		   " st_read", my_index, my_pid);
+         " st_read", my_index, my_pid);
+    }
 
     switch (signo) {
     case SIGHUP:
       err_report(errfd, "INFO: process %d (pid %d): caught SIGHUP,"
-		 " reloading configuration", my_index, my_pid);
+       " reloading configuration", my_index, my_pid);
       if (interactive_mode) {
-	load_configs();
-	break;
+   load_configs();
+   break;
       }
       /* Reopen log files - needed for log rotation */
       if (log_access) {
-	logbuf_flush();
-	logbuf_close();
-	logbuf_open();
+   logbuf_flush();
+   logbuf_close();
+   logbuf_open();
       }
       close(errfd);
       if ((errfd = open(ERRORS_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644)) < 0)
-	err_sys_quit(STDERR_FILENO, "ERROR: process %d (pid %d): signal"
-		     " processor: open", my_index, my_pid);
+   err_sys_quit(STDERR_FILENO, "ERROR: process %d (pid %d): signal"
+           " processor: open", my_index, my_pid);
       /* Reload configuration */
       load_configs();
       break;
@@ -775,19 +900,19 @@ static void *process_signals(void *arg)
        * it will take to gracefully complete all client sessions.
        */
       err_report(errfd, "INFO: process %d (pid %d): caught SIGTERM,"
-		 " terminating", my_index, my_pid);
+       " terminating", my_index, my_pid);
       if (log_access)
-	logbuf_flush();
+   logbuf_flush();
       exit(0);
     case SIGUSR1:
       err_report(errfd, "INFO: process %d (pid %d): caught SIGUSR1",
-		 my_index, my_pid);
+       my_index, my_pid);
       /* Print server info to stderr */
       dump_server_info();
       break;
     default:
       err_report(errfd, "INFO: process %d (pid %d): caught signal %d",
-		 my_index, my_pid, signo);
+       my_index, my_pid, signo);
     }
   }
 
@@ -812,6 +937,16 @@ static void *flush_acclog_buffer(void *arg)
   return NULL;
 }
 
+static void *print_stats(void *arg)
+{
+  for ( ; ; ) {
+    st_sleep(MONITOR_INTERVAL);
+    print_connection_count(sem_set_id);
+  }
+
+  /* NOTREACHED */
+  return NULL;
+}
 
 /******************************************************************/
 
@@ -822,22 +957,22 @@ static void start_threads(void)
   /* Create access log flushing thread */
   if (log_access && st_thread_create(flush_acclog_buffer, NULL, 0, 0) == NULL)
     err_sys_quit(errfd, "ERROR: process %d (pid %d): can't create"
-		 " log flushing thread", my_index, my_pid);
+       " log flushing thread", my_index, my_pid);
 
   /* Create connections handling threads */
   for (i = 0; i < sk_count; i++) {
     err_report(errfd, "INFO: process %d (pid %d): starting %d threads"
-	       " on %s:%u", my_index, my_pid, max_wait_threads,
-	       srv_socket[i].addr, srv_socket[i].port);
+          " on %s:%u", my_index, my_pid, max_wait_threads,
+          srv_socket[i].addr, srv_socket[i].port);
     WAIT_THREADS(i) = 0;
     BUSY_THREADS(i) = 0;
     RQST_COUNT(i) = 0;
     for (n = 0; n < max_wait_threads; n++) {
       if (st_thread_create(handle_connections, (void *)i, 0, 0) != NULL)
-	WAIT_THREADS(i)++;
+   WAIT_THREADS(i)++;
       else
-	err_sys_report(errfd, "ERROR: process %d (pid %d): can't create"
-		       " thread", my_index, my_pid);
+   err_sys_report(errfd, "ERROR: process %d (pid %d): can't create"
+             " thread", my_index, my_pid);
     }
     if (WAIT_THREADS(i) == 0)
       exit(1);
@@ -858,8 +993,7 @@ static void *handle_connections(void *arg)
   fromlen = sizeof(from);
 
   while (WAIT_THREADS(i) <= max_wait_threads) {
-    cli_nfd = st_accept(srv_nfd, (struct sockaddr *)&from, &fromlen,
-     ST_UTIME_NO_TIMEOUT);
+    cli_nfd = st_accept(srv_nfd, (struct sockaddr *)&from, &fromlen, ST_UTIME_NO_TIMEOUT);
     if (cli_nfd == NULL) {
       err_sys_report(errfd, "ERROR: can't accept connection: st_accept");
       continue;
@@ -872,10 +1006,16 @@ static void *handle_connections(void *arg)
     if (WAIT_THREADS(i) < min_wait_threads && TOTAL_THREADS(i) < max_threads) {
       /* Create another spare thread */
       if (st_thread_create(handle_connections, (void *)i, 0, 0) != NULL)
-	WAIT_THREADS(i)++;
+   WAIT_THREADS(i)++;
       else
-	err_sys_report(errfd, "ERROR: process %d (pid %d): can't create"
-		       " thread", my_index, my_pid);
+   err_sys_report(errfd, "ERROR: process %d (pid %d): can't create"
+             " thread", my_index, my_pid);
+    } else {
+      if (TOTAL_THREADS(i) >= max_threads) {
+         err_sys_report(errfd, "ERROR: process %d (pid %d): reach max threads %d",
+             my_index, my_pid, max_threads);
+      }
+
     }
 
     handle_session(i, cli_nfd);
@@ -905,15 +1045,15 @@ static void dump_server_info(void)
   len = sprintf(buf, "\n\nProcess #%d (pid %d):\n", my_index, (int)my_pid);
   for (i = 0; i < sk_count; i++) {
     len += sprintf(buf + len, "\nListening Socket #%d:\n"
-		   "-------------------------\n"
-		   "Address                    %s:%u\n"
-		   "Thread limits (min/max)    %d/%d\n"
-		   "Waiting threads            %d\n"
-		   "Busy threads               %d\n"
-		   "Requests served            %d\n",
-		   i, srv_socket[i].addr, srv_socket[i].port,
-		   max_wait_threads, max_threads,
-		   WAIT_THREADS(i), BUSY_THREADS(i), RQST_COUNT(i));
+         "-------------------------\n"
+         "Address                    %s:%u\n"
+         "Thread limits (min/max)    %d/%d\n"
+         "Waiting threads            %d\n"
+         "Busy threads               %d\n"
+         "Requests served            %d\n",
+         i, srv_socket[i].addr, srv_socket[i].port,
+         max_wait_threads, max_threads,
+         WAIT_THREADS(i), BUSY_THREADS(i), RQST_COUNT(i));
   }
 
   write(STDERR_FILENO, buf, len);
@@ -932,19 +1072,27 @@ void handle_session(long srv_socket_index, st_netfd_t cli_nfd)
 {
   static char resp[] = "HTTP/1.0 200 OK\r\nContent-type: text/html\r\n"
                        "Connection: close\r\n\r\n<H2>It worked!</H2>\n";
-  char buf[512];
+  char buf[2048];
   int n = sizeof(resp) - 1;
   struct in_addr *from = st_netfd_getspecific(cli_nfd);
 
-  if (st_read(cli_nfd, buf, sizeof(buf), SEC2USEC(REQUEST_TIMEOUT)) < 0) {
-    err_sys_report(errfd, "WARN: can't read request from %s: st_read",
-		   inet_ntoa(*from));
-    return;
-  }
-  if (st_write(cli_nfd, resp, n, ST_UTIME_NO_TIMEOUT) != n) {
-    err_sys_report(errfd, "WARN: can't write response to %s: st_write",
-		   inet_ntoa(*from));
-    return;
+  increase_connection_count(sem_set_id);
+  while(1) {
+    //n = st_read(cli_nfd, buf, sizeof(buf), SEC2USEC(REQUEST_TIMEOUT));
+    n = st_read(cli_nfd, buf, sizeof(buf), ST_UTIME_NO_TIMEOUT);
+    if (n <= 0) {
+      err_sys_report(errfd, "WARN: can't read request from %s: st_read timeout",
+           inet_ntoa(*from));
+      decrease_connection_count(sem_set_id);
+      return;
+    }
+    //if (st_write(cli_nfd, buf, n, 10000 /*microsecond*/) != n) {
+    if (st_write(cli_nfd, buf, n, ST_UTIME_NO_TIMEOUT) != n) {
+      err_sys_report(errfd, "WARN: can't write response to %s: st_write",
+           inet_ntoa(*from));
+      decrease_connection_count(sem_set_id);
+      return;
+    }
   }
 
   RQST_COUNT(srv_socket_index)++;
@@ -957,7 +1105,7 @@ void handle_session(long srv_socket_index, st_netfd_t cli_nfd)
 void load_configs(void)
 {
   err_report(errfd, "INFO: process %d (pid %d): configuration loaded",
-	     my_index, my_pid);
+        my_index, my_pid);
 }
 
 

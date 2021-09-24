@@ -141,7 +141,8 @@ int st_init(void)
   }
 
   /* We can ignore return value here */
-  st_set_eventsys(ST_EVENTSYS_DEFAULT);
+  //st_set_eventsys(ST_EVENTSYS_DEFAULT);
+  st_set_eventsys(ST_EVENTSYS_ALT);
 
   if (_st_io_init() < 0)
     return -1;
